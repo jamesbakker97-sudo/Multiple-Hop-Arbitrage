@@ -1,0 +1,52 @@
+# Node.js / TypeScript
+node_modules/
+dist/
+coverage/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+package-lock.json
+pnpm-lock.yaml
+
+# Environment files
+.env
+.env.*
+
+# Hardhat
+cache/
+artifacts/
+coverage/
+
+# Control plane build output
+control-plane/dist/
+
+# Rust
+**/target/
+**/*.rs.bk
+**/*.rlib
+**/*.d
+**/*.exe
+**/*.dll
+**/*.so
+**/*.dylib
+Cargo.lock
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*.pid
+*.seed
+
+# Ignore build directories
+build/
