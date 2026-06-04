@@ -82,7 +82,20 @@ impl HotPathEngine {
             if line.trim().is_empty() {
                 continue;
             }
-            let msg: ControlMessage = serde_json::from_str(&line)?;
+            let msg: ControlMessage = match serde_json::from_str(&line) {
+                Ok(m) => m,
+                Err(e) => {
+                    // Don't let a single malformed control message crash the engine.
+                    // Log the parse error and continue processing subsequent lines.
+                    self.emit_log(
+                        &mut writer,
+                        "error",
+                        format!("failed to parse control message: {} -- line: {}", e, line),
+                    )
+                    .await?;
+                    continue;
+                }
+            };
             match msg {
                 ControlMessage::Bootstrap { pools } => {
                     for pool in pools {

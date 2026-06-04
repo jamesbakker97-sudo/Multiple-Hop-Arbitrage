@@ -90,6 +90,7 @@ export const configSchema = z.object({
     ENGINE_DISABLED_POOL_IDS: z.string().optional(),
     EXECUTOR_PRIVATE_KEY: optionalPrivateKeySchema,
     EXECUTOR_PRIVATE_KEY_PATH: z.string().optional(),
+    REMOTE_SIGNER_URL: optionalUrlSchema,
     EXECUTOR_ALLOW_INLINE_PRIVATE_KEY: envBoolean(false),
     EXECUTOR_PAPER_TRADING: envBoolean(false),
     EXECUTOR_PAPER_VALIDATE_CALL: envBoolean(true),
@@ -155,11 +156,11 @@ export const configSchema = z.object({
             message: "must be true to use public_only or relay_preferred submission",
         });
     }
-    if (!config.EXECUTOR_PRIVATE_KEY && !config.EXECUTOR_PRIVATE_KEY_PATH) {
+    if (!config.EXECUTOR_PRIVATE_KEY && !config.EXECUTOR_PRIVATE_KEY_PATH && !config.REMOTE_SIGNER_URL) {
         ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: ["EXECUTOR_PRIVATE_KEY"],
-            message: "EXECUTOR_PRIVATE_KEY or EXECUTOR_PRIVATE_KEY_PATH is required when executor starts unpaused",
+            message: "EXECUTOR_PRIVATE_KEY, EXECUTOR_PRIVATE_KEY_PATH, or REMOTE_SIGNER_URL is required when executor starts unpaused",
         });
     }
     if (config.EXECUTOR_PRIVATE_KEY && !config.EXECUTOR_ALLOW_INLINE_PRIVATE_KEY) {

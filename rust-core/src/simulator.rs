@@ -267,7 +267,7 @@ fn simulate_stable_swap(
     // periods when it needs rebalancing most.
     let effective_fee = if imbalance_bps > stable_max_imbalance_bps as u128 {
         let excess_bps = imbalance_bps - stable_max_imbalance_bps as u128;
-        // Scale fee linearly: each bps of excess adds 3 bps to the fee
+        // Scale fee linearly: each bps of excess adds 6 bps to the fee (as implemented below)
         let penalty_bps = excess_bps.saturating_mul(6);
         fee_bps as u128 + penalty_bps
     } else {

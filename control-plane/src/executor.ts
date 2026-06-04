@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import { dirname } from "node:path";
 import { AbiCoder, Contract, Interface, JsonRpcProvider, Wallet, type TransactionRequest } from "ethers";
 import { createLogger } from "./logger.js";
+import RemoteSigner from "./remoteSigner.js";
 import type { CuMeter } from "./cuMeter.js";
 import { flashLoanExecutorAbi } from "./executorAbi.js";
 import type { AppConfig } from "./config.js";
@@ -148,7 +149,7 @@ export class ExecutorClient {
   private readonly provider?: JsonRpcProvider;
   private readonly relayProvider?: JsonRpcProvider;
   private readonly signerWallet?: Wallet;
-  private readonly address?: string;
+  private address?: string;
   private nonceCoordinator?: NonceCoordinator;
   private readonly submissionMode: "public_only" | "relay_preferred" | "relay_only";
   private readonly allowPublicMempool: boolean;
@@ -186,6 +187,7 @@ export class ExecutorClient {
   private maxInflight: number;
   private readonly routeByCycleId: Map<string, RouteRuntimePlan>;
   private readonly oneInch: OneInchClient;
+  private readonly remoteSigner?: RemoteSigner;
   private readonly contractInterface = new Interface(flashLoanExecutorAbi);
   private readonly abiCoder = AbiCoder.defaultAbiCoder();
   private readonly inflight = new Map<string, ExecutionRecord>();
@@ -322,6 +324,27 @@ export class ExecutorClient {
     if (config.EXECUTOR_PRIVATE_KEY) {
       this.signerWallet = new Wallet(config.EXECUTOR_PRIVATE_KEY);
       this.address = this.signerWallet.address.toLowerCase();
+    }
+
+    if (config.REMOTE_SIGNER_URL) {
+      try {
+        this.remoteSigner = new RemoteSigner(config.REMOTE_SIGNER_URL);
+        // asynchronously resolve remote signer address and initialize nonce coordinator
+        if (this.provider || this.relayProvider) {
+          const probe = this.provider ?? this.relayProvider!;
+          void this.remoteSigner
+            .getAddress()
+            .then((addr) => {
+              this.address = addr.toLowerCase();
+              this.nonceCoordinator = new NonceCoordinator(probe, this.address!, this.cuMeter);
+            })
+            .catch((err) => {
+              this.log.error({ error: err }, "failed to initialize remote signer address");
+            });
+        }
+      } catch (error) {
+        this.log.error({ error }, "failed to initialize remote signer");
+      }
     }
 
     if (config.PRIVATE_RELAY_RPC_URL) {
@@ -1525,13 +1548,20 @@ export class ExecutorClient {
       txRequest.nonce = nonce;
     }
 
-    if (!this.signerWallet) {
+    if (!this.signerWallet && !this.remoteSigner) {
       throw new Error("no available submission path for executor");
     }
 
     if (relayAllowed && this.relayProvider) {
       try {
-        const signer = this.signerWallet.connect(this.relayProvider);
+        if (this.remoteSigner) {
+          const signed = await this.remoteSigner.sign(txRequest);
+          const tx = await (this.relayProvider as any).sendTransaction(signed);
+          this.cuMeter?.recordMethod("eth_sendRawTransaction");
+          return { tx, submissionTarget: "relay" };
+        }
+
+        const signer = this.signerWallet!.connect(this.relayProvider);
         const tx = await signer.sendTransaction(txRequest);
         this.cuMeter?.recordMethod("eth_sendRawTransaction");
         return { tx, submissionTarget: "relay" };
@@ -1544,7 +1574,13 @@ export class ExecutorClient {
     }
 
     if (publicAllowed && this.provider) {
-      const signer = this.signerWallet.connect(this.provider);
+      if (this.remoteSigner) {
+        const signed = await this.remoteSigner.sign(txRequest);
+        const tx = await (this.provider as any).sendTransaction(signed);
+        this.cuMeter?.recordMethod("eth_sendRawTransaction");
+        return { tx, submissionTarget: "public" };
+      }
+      const signer = this.signerWallet!.connect(this.provider);
       const tx = await signer.sendTransaction(txRequest);
       this.cuMeter?.recordMethod("eth_sendRawTransaction");
       return { tx, submissionTarget: "public" };
