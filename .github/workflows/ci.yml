@@ -56,12 +56,12 @@ jobs:
         run: npm test || true
 
   image:
-    name: Build Docker images & scan
+    name: Build, push Docker images & scan
     runs-on: ubuntu-latest
     needs: build
     env:
-      IMAGE_RUST: rust-core:${{ github.sha }}
-      IMAGE_CONTROL_PLANE: control-plane:${{ github.sha }}
+      IMAGE_RUST: ghcr.io/${{ github.repository }}/rust-core:${{ github.sha }}
+      IMAGE_CONTROL_PLANE: ghcr.io/${{ github.repository }}/control-plane:${{ github.sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -71,6 +71,13 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build rust-core (release)
         run: |
@@ -86,8 +93,13 @@ jobs:
           ENTRYPOINT ["/usr/local/bin/rust-core"]
           EOF
 
-      - name: Build rust-core image
-        run: docker build -f rust-core/Dockerfile.ci -t $IMAGE_RUST .
+      - name: Build and push rust-core image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: rust-core/Dockerfile.ci
+          push: true
+          tags: ${{ env.IMAGE_RUST }}
 
       - name: Create control-plane Dockerfile
         run: |
@@ -99,15 +111,24 @@ jobs:
           CMD ["node", "dist/index.js"]
           EOF
 
-      - name: Build control-plane image
-        run: docker build -f control-plane/Dockerfile.ci -t $IMAGE_CONTROL_PLANE .
+      - name: Build and push control-plane image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: control-plane/Dockerfile.ci
+          push: true
+          tags: ${{ env.IMAGE_CONTROL_PLANE }}
 
-      - name: Scan rust image with Trivy
+      - name: Scan rust image with Trivy (fail on HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@v0.2.0
         with:
           image-ref: ${{ env.IMAGE_RUST }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'
 
-      - name: Scan control-plane image with Trivy
+      - name: Scan control-plane image with Trivy (fail on HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@v0.2.0
         with:
           image-ref: ${{ env.IMAGE_CONTROL_PLANE }}
+          severity: CRITICAL,HIGH
+          exit-code: '1'
