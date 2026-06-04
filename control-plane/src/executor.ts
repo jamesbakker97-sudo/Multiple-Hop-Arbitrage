@@ -731,8 +731,64 @@ export class ExecutorClient {
       return { ok: true, finalOutput: borrowAmount + BigInt(candidate.expected_profit), quotedProfit: BigInt(candidate.expected_profit) };
     }
     if (route.swaps.some((swap) => swap.kind === "one_inch")) {
+      // 1inch routes: use the 1inch API's /swap endpoint to get a quoted dstAmount.
+      // This validates the Rust simulator's profit estimate against the live DEX aggregator quote.
+      if (!this.oneInch.isEnabled()) {
+        return { ok: false, reason: "route quote validation unavailable: one_inch client not configured" };
+      }
+
       const borrowAmount = BigInt(candidate.borrow_amount);
-      return { ok: true, finalOutput: borrowAmount + BigInt(candidate.expected_profit), quotedProfit: BigInt(candidate.expected_profit) };
+      try {
+        // Only the first swap can be 1inch (enforced in encodeRouteData).
+        const oneInchSwap = route.swaps.find((s) => s.kind === "one_inch")!;
+        const quote = await this.oneInch.buildSwap({
+          chainId: oneInchSwap.chainId,
+          fromTokenAddress: oneInchSwap.tokenIn,
+          toTokenAddress: oneInchSwap.tokenOut,
+          amount: borrowAmount,
+          fromAddress: oneInchSwap.adapter,
+          receiver: this.contractAddress ?? "0x0000000000000000000000000000000000000001",
+          slippageBps: oneInchSwap.slippageBps,
+          protocols: oneInchSwap.protocols,
+          referrerAddress: oneInchSwap.referrerAddress,
+          complexityLevel: oneInchSwap.complexityLevel,
+          disableEstimate: oneInchSwap.disableEstimate,
+          allowPartialFill: oneInchSwap.allowPartialFill,
+          includeTokensInfo: oneInchSwap.includeTokensInfo,
+          includeProtocols: oneInchSwap.includeProtocols,
+          includeGas: oneInchSwap.includeGas,
+        });
+
+        if (!quote.dstAmount) {
+          return { ok: false, reason: "1inch quote missing dstAmount" };
+        }
+
+        const finalOutput = BigInt(quote.dstAmount);
+        const quotedProfit = finalOutput - borrowAmount;
+
+        if (quotedProfit <= effectiveMinProfit) {
+          return {
+            ok: false,
+            reason: "candidate rejected below 1inch quote profit gate",
+            finalOutput,
+            quotedProfit,
+          };
+        }
+
+        // If there are remaining swaps after 1inch, quote those too
+        const remainingSwaps = route.swaps.slice(route.swaps.indexOf(oneInchSwap) + 1);
+        if (remainingSwaps.length > 0) {
+          const remainderOutput = await this.quoteRoute({ ...route, swaps: remainingSwaps }, finalOutput);
+          return { ok: true, finalOutput: remainderOutput, quotedProfit: remainderOutput - borrowAmount };
+        }
+
+        return { ok: true, finalOutput, quotedProfit };
+      } catch (error) {
+        return {
+          ok: false,
+          reason: `1inch quote validation failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
     }
     if (!this.provider) {
       return { ok: false, reason: "route quote validation unavailable: provider missing" };
@@ -927,7 +983,7 @@ export class ExecutorClient {
     };
     const gasEstimate = await this.provider.estimateGas(tx);
     this.cuMeter?.recordMethod("eth_estimateGas");
-    const l1CalldataGas = await this.estimateArbitrumL1CalldataGas(tx);
+    const l1CalldataGas = await this.estimateArbitrumL1CalldataGas(tx, gasEstimate);
     this.gasEstimateCache.set(cacheKey, { gasEstimate, l1CalldataGas, updatedAt: now });
     return this.toGasCostEstimate(gasEstimate, l1CalldataGas, gasPriceWei);
   }
@@ -949,7 +1005,7 @@ export class ExecutorClient {
     };
   }
 
-  private async estimateArbitrumL1CalldataGas(tx: { to: string; from: string; data: string }): Promise<bigint> {
+  private async estimateArbitrumL1CalldataGas(tx: { to: string; from: string; data: string }, l2GasEstimate: bigint): Promise<bigint> {
     if (!this.provider || !this.arbitrumNodeInterfaceAddress) {
       return 0n;
     }
@@ -968,8 +1024,12 @@ export class ExecutorClient {
       const decoded = iface.decodeFunctionResult("gasEstimateComponents", response);
       return BigInt(String(decoded.gasEstimateForL1));
     } catch (error) {
-      this.log.error({ error }, "arbitrum l1 calldata fee estimate failed; falling back to l2 gas estimate only");
-      return 0n;
+      this.log.error({ error }, "arbitrum l1 calldata fee estimate failed; using conservative fallback (50% of L2 gas)");
+      // Conservative fallback: assume L1 calldata gas is 50% of L2 execution gas.
+      // On Arbitrum, L1 calldata can be 50-80% of total cost. Overestimating is safer
+      // than underestimating (the old behavior of returning 0n) because it causes
+      // marginal trades to be rejected instead of accepted at a loss.
+      return l2GasEstimate / 2n;
     }
   }
 
@@ -1108,7 +1168,7 @@ export class ExecutorClient {
 
     this.recordFailure("reverted");
     const txCostWei = this.transactionCostWei(receipt);
-    const estimatedNetProfitWei = this.estimatedNetProfitWei(record, txCostWei) ?? (-txCostWei);
+    const estimatedNetProfitWei = this.estimatedNetProfitWei(record, txCostWei);
     this.applyEstimatedNet(estimatedNetProfitWei);
     this.log.error({ hash, cycleId: record.cycleId, blockNumber: receipt.blockNumber }, "execution transaction reverted");
     await this.writeJournal({
@@ -1757,12 +1817,19 @@ export class ExecutorClient {
     return receipt.gasUsed * (receipt.gasPrice ?? 0n);
   }
 
-  private estimatedNetProfitWei(record: ExecutionRecord, txCostWei: bigint): bigint | undefined {
-    if (!this.wrappedNativeToken || record.borrowToken.toLowerCase() !== this.wrappedNativeToken) {
-      return undefined;
+  private estimatedNetProfitWei(record: ExecutionRecord, txCostWei: bigint): bigint {
+    // When the borrow token matches the wrapped native token (e.g. WETH), we can
+    // directly compute net profit as (expected profit - tx cost).
+    if (this.wrappedNativeToken && record.borrowToken.toLowerCase() === this.wrappedNativeToken) {
+      return BigInt(record.expectedProfit) - txCostWei;
     }
 
-    return BigInt(record.expectedProfit) - txCostWei;
+    // For non-WETH borrows we cannot measure profit in Wei terms.
+    // Use a conservative estimate: assume the trade made zero profit, so net = -txCost.
+    // This ensures the cumulative loss circuit breaker (maxCumulativeEstimatedLossWei)
+    // always fires when gas costs accumulate, even for stablecoin borrows.
+    // On a confirmed trade, this is pessimistic; on a reverted trade, accurate.
+    return -txCostWei;
   }
 
   private applyEstimatedNet(value?: bigint): void {

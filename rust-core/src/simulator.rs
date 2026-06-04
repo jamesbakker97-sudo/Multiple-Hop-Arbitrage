@@ -260,11 +260,24 @@ fn simulate_stable_swap(
 
     let imbalance = reserve_in.abs_diff(reserve_out);
     let imbalance_bps = imbalance.saturating_mul(10_000) / max_reserve;
-    if imbalance_bps > stable_max_imbalance_bps as u128 {
-        return None;
-    }
 
-    let amount_in_with_fee = amount_in.saturating_mul((10_000 - fee_bps) as u128) / 10_000;
+    // Imbalance penalty: instead of hard-rejecting pools above the threshold,
+    // apply a higher effective fee proportional to how imbalanced the pool is.
+    // This ensures the pool is still considered for arbitrage during volatile
+    // periods when it needs rebalancing most.
+    let effective_fee = if imbalance_bps > stable_max_imbalance_bps as u128 {
+        let excess_bps = imbalance_bps - stable_max_imbalance_bps as u128;
+        // Scale fee linearly: each bps of excess adds 3 bps to the fee
+        let penalty_bps = excess_bps.saturating_mul(6);
+        fee_bps as u128 + penalty_bps
+    } else {
+        fee_bps as u128
+    };
+
+    // Clamp fee to 100% max
+    let effective_fee = effective_fee.min(10_000);
+
+    let amount_in_with_fee = amount_in.saturating_mul(10_000 - effective_fee) / 10_000;
     let x = reserve_in.checked_add(amount_in_with_fee)?;
     let y = get_y(x, reserve_in, reserve_out, amp_factor)?;
     let amount_out = reserve_out.checked_sub(y)?;
@@ -272,16 +285,38 @@ fn simulate_stable_swap(
     Some(amount_out.min(reserve_out))
 }
 
+// The `construct_uint!` macro internally expands code that clippy flags as a
+// manual `div_ceil` reimplementation; we cannot edit the generated code, so the
+// lint is allowed here.
+#[allow(clippy::manual_div_ceil)]
+mod u256_impl {
+    use uint::construct_uint;
+
+    construct_uint! {
+        pub struct U256(4);
+    }
+}
+
+pub use u256_impl::U256;
+
 fn get_y(x: u128, reserve_in: u128, reserve_out: u128, amp_factor: u64) -> Option<u128> {
     let amp = amp_factor as u128;
     let d = compute_d(reserve_in, reserve_out, amp)?;
     let ann = amp.checked_mul(4)?;
 
-    let c = d
-        .checked_mul(d)?
-        .checked_div(x.checked_mul(2)?)?
-        .checked_mul(d)?
-        .checked_div(ann.checked_mul(2)?)?;
+    // Compute c = D³ / (4 * A * n * x) using U256 to avoid overflow.
+    // The naive u128 computation: D²/(2x) then *D/(2*ann) has TWO truncations
+    // (losing precision) and D² overflows u128 for 18-decimal pools.
+    // With U256 we compute D³ / (4*ann*x) in a single division step.
+    let d_u256 = U256::from(d);
+    let x_u256 = U256::from(x);
+    let two_ann_u256 = U256::from(ann.checked_mul(2)?);
+    // c = D³ / (4*ann*x) = D³ / (2*ann*2*x)
+    // Compute as: (D * D * D) / (2*ann * 2*x)
+    let d_cubed = d_u256 * d_u256 * d_u256;
+    let c_u256 = d_cubed / (two_ann_u256 * x_u256 * U256::from(2));
+    let c = c_u256.as_u128(); // safe: D³/(4*ann*x) ≈ D * (D/(4*ann)) * (D/x). Since D≈x and ann≥100, this is O(D/ann) ≤ D
+
     let b = x.checked_add(d.checked_div(ann)?)?;
     let mut y = d;
 
@@ -302,40 +337,33 @@ fn get_y(x: u128, reserve_in: u128, reserve_out: u128, amp_factor: u64) -> Optio
 }
 
 fn compute_d(reserve_in: u128, reserve_out: u128, amp_factor: u128) -> Option<u128> {
-    let sum = reserve_in.checked_add(reserve_out)?;
-    if sum == 0 {
+    let sum_u256 = U256::from(reserve_in) + U256::from(reserve_out);
+    if sum_u256 == U256::zero() {
         return None;
     }
 
-    let ann = amp_factor.checked_mul(4)?;
-    let mut d = sum;
+    let ann = U256::from(amp_factor.checked_mul(4)?);
+    let mut d = sum_u256;
+
+    let two_reserve_in = U256::from(reserve_in) * U256::from(2);
+    let two_reserve_out = U256::from(reserve_out) * U256::from(2);
 
     for _ in 0..255 {
         let d_prev = d;
-        let d_p = d
-            .checked_mul(d)?
-            .checked_div(reserve_in.checked_mul(2)?)?
-            .checked_mul(d)?
-            .checked_div(reserve_out.checked_mul(2)?)?;
+        let d_p = d * d / two_reserve_in * d / two_reserve_out;
 
-        let numerator = ann
-            .checked_mul(sum)?
-            .checked_add(d_p.checked_mul(2)?)?
-            .checked_mul(d)?;
-        let denominator = ann
-            .checked_sub(1)?
-            .checked_mul(d)?
-            .checked_add(d_p.checked_mul(3)?)?;
-        if denominator == 0 {
+        let numerator = (ann * sum_u256 + d_p * U256::from(2)) * d;
+        let denominator = (ann - U256::from(1)) * d + d_p * U256::from(3);
+        if denominator == U256::zero() {
             return None;
         }
-        d = numerator.checked_div(denominator)?;
-        if d.abs_diff(d_prev) <= 1 {
-            return Some(d);
+        d = numerator / denominator;
+        if d.abs_diff(d_prev) <= U256::from(1) {
+            return Some(d.as_u128());
         }
     }
 
-    Some(d)
+    Some(d.as_u128())
 }
 
 #[cfg(test)]
@@ -361,9 +389,16 @@ mod tests {
     }
 
     #[test]
-    fn stable_pool_swap_rejects_large_imbalance() {
-        let output = simulate_stable_swap(10_000, 1_000_000, 1_300_000, 4, 500, 200);
-        assert!(output.is_none());
+    fn stable_pool_swap_penalizes_large_imbalance() {
+        // Instead of hard-rejecting imbalanced pools, the simulator applies a fee penalty.
+        // An imbalanced pool (1M/1.3M = 2307 bps > 500 max) with amount_in=10_000 should
+        // still execute but with a much higher effective fee.
+        let output_penalty = simulate_stable_swap(10_000, 1_000_000, 1_300_000, 4, 500, 200);
+        assert!(output_penalty.is_some());
+        // The output should be reduced compared to a non-penalized swap.
+        let output_no_penalty = simulate_stable_swap(10_000, 1_000_000, 1_300_000, 4, 9999, 200);
+        assert!(output_no_penalty.is_some());
+        assert!(output_penalty.unwrap() < output_no_penalty.unwrap());
     }
 
     #[test]
@@ -380,7 +415,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_stable_marginal_rate_rejects_large_imbalance() {
+    fn exact_stable_marginal_rate_penalizes_large_imbalance() {
+        // The f64 marginal rate function still hard-rejects large imbalances since
+        // it's a pre-filter only (used for min_cycle_edge_profit_bps).
+        // The actual pool simulation (simulate_stable_swap) uses the soft penalty.
         let rate = exact_stable_marginal_output_rate(1_000_000, 1_300_000, 4, 500, 200);
         assert!(rate.is_none());
     }

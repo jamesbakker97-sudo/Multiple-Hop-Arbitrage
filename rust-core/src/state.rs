@@ -24,6 +24,7 @@ pub struct StateStore {
     pools: DashMap<String, PoolState>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum UpdateOutcome {
     Applied { previous: PoolState, current: PoolState },
@@ -93,6 +94,10 @@ impl StateStore {
 
     pub fn len(&self) -> usize {
         self.pools.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pools.is_empty()
     }
 
     pub fn latest_block(&self) -> u64 {

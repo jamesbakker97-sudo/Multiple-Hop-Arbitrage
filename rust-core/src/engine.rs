@@ -180,7 +180,7 @@ impl HotPathEngine {
                             let mut seen_cycles = HashSet::new();
                             let cycles = affected_cycles
                                 .into_iter()
-                                .chain(bellman_ford_cycles.into_iter())
+                                .chain(bellman_ford_cycles)
                                 .filter(|cycle| seen_cycles.insert(cycle.id.clone()))
                                 .collect::<Vec<_>>();
                             self.simulated_cycles_total = self
