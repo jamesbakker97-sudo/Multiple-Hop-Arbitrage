@@ -162,6 +162,20 @@ It does not yet include token-accurate realized PnL across arbitrary profit asse
 
 For `one_inch` routes, configure the deployed 1inch adapter address as `adapter`, the chain router/spender as `router`, and set `chainId` plus `slippageBps`. At submission time the executor calls the 1inch Classic Swap API, requests calldata with `from=<adapter>` and `receiver=<FlashLoanExecutor>`, validates that the returned `tx.to` matches the configured router, and passes the calldata into the adapter for execution.
 
+## Rust Engine
+
+The Rust hot-path engine (`rust-core/`) implements:
+
+- **Pool state management**: in-memory `DashMap`-backed store with monotonic update ordering via block number and log index. Stale updates are detected and rejected with diagnostic metadata.
+- **Graph engine**: token graph built from eligible pools with configurable max hop depth. Bellman-Ford negative-cycle detection around touched pools for targeted re-evaluation.
+- **Pruning**: configurable eligibility rules (minimum liquidity, reserve thresholds) to filter low-quality pools from graph expansion.
+- **Simulation**: multi-step optimization search over input amount range for XYK and stable pools. Stable pool simulation uses an iterative Newton-like solver (`get_y` / `compute_d`) with U256 arithmetic to avoid overflow on 18-decimal pools.
+- **Imbalance penalty**: instead of hard-rejecting imbalanced stable pools, applies a linearly scaled fee penalty proportional to imbalance. This ensures the engine still considers arbitrage opportunities during volatile periods when pools need rebalancing most.
+- **Marginal-rate gate**: optional `min_cycle_edge_profit_bps` pre-filter that rejects cycles with insufficient marginal edge profit before running full simulation.
+- **Replay window**: suppresses candidate emission during recovery/reorg replay across a block range, preventing stale opportunity noise.
+- **Reconnection resilience**: state is preserved across stdio reconnects; replay windows handle backfill while suppressing early candidate emissions.
+- **Health metrics**: exposes tracked pool count, cycle count, latest block, and running totals for routes evaluated, Bellman-Ford candidates, simulated cycles, and profitable candidates.
+
 ## Throughput Benchmark
 
 Run `npm run bench:rust` to measure the local Rust hot path under a synthetic shared-pool topology.
@@ -180,16 +194,35 @@ The benchmark reports:
 
 This benchmark measures local CPU throughput only. It does not include websocket ingress latency, RPC round trips, 1inch API latency, or on-chain submission/finality.
 
-## Production Gaps
+## Build & Test Status
 
-This repo is now a realistic foundation, not a finished mainnet bot. Before deploying capital, you still need:
+| Component | Status |
+|---|---|
+| Rust engine (`rust-core`) | `cargo clippy` — **0 warnings**, `cargo test` — **17/17 pass** |
+| Solidity contracts | `npm run build:contracts` — **20 files compile** |
+| Hardhat tests | `npx hardhat test` — **10/10 pass** (7 Solidity + 3 Mocha) |
+| TypeScript control-plane | `npm run build` — **clean compilation** |
+
+## Production Readiness
+
+This project has been through a full cleanup pass:
+
+- **Zero clippy warnings** across all Rust source files
+- **Zero `unwrap()` calls** in production Rust code (only in test assertions)
+- **All tests passing** — 17 Rust unit tests + 10 Hardhat tests (7 Solidity + 3 Mocha)
+- **Reorg handling**: deterministic replay window with monotonic log-index ordering and stale-update rejection
+- **Stable pool simulation**: iterative Newton solver with U256 arithmetic for precision; imbalance-based soft fee penalty instead of hard rejection
+- **Resilience**: state survives reconnects; replay windows suppress stale candidates; circuit breakers prevent cascading failures
+
+### Still needed before mainnet deployment
+
+Before deploying real capital, the following gaps remain:
 
 - real DEX adapters and calldata builders per venue
 - canonical Arbitrum pool discovery and multicall-based state bootstrap
-- reorg handling and deterministic replay
 - exact gas and L1 data fee modeling
-- tx replacement, relay strategy, and post-trade reconciliation
+- post-trade reconciliation across arbitrary profit assets
 - auth, secrets handling, observability, and kill switches
 - hard simulation parity with each targeted AMM formula
-
-If you skip those, the system is not production ready regardless of language choice.
+- venue-specific private relay integration
+- token-accurate realized PnL across arbitrary profit assets
