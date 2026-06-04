@@ -106,6 +106,7 @@ export const configSchema = z.object({
   ENGINE_DISABLED_POOL_IDS: z.string().optional(),
   EXECUTOR_PRIVATE_KEY: optionalPrivateKeySchema,
   EXECUTOR_PRIVATE_KEY_PATH: z.string().optional(),
+  REDIS_URL: optionalUrlSchema,
   REMOTE_SIGNER_URL: optionalUrlSchema,
   EXECUTOR_ALLOW_INLINE_PRIVATE_KEY: envBoolean(false),
   EXECUTOR_PAPER_TRADING: envBoolean(false),

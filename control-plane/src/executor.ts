@@ -2,6 +2,7 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { dirname } from "node:path";
 import { AbiCoder, Contract, Interface, JsonRpcProvider, Wallet, type TransactionRequest } from "ethers";
+import Redis from "ioredis";
 import { createLogger } from "./logger.js";
 import RemoteSigner from "./remoteSigner.js";
 import type { CuMeter } from "./cuMeter.js";
@@ -105,7 +106,12 @@ type GasTokenEstimate =
   | { ok: true; gasCostInToken: bigint; token: string; source: "wrapped_native" | "configured_route" }
   | { ok: false; reason: string; token: string };
 
-class NonceCoordinator {
+interface INonceCoordinator {
+  acquire(): Promise<number>;
+  setProvider(provider: JsonRpcProvider): void;
+}
+
+class NonceCoordinator implements INonceCoordinator {
   private provider: JsonRpcProvider;
   private address: string;
   private readonly cuMeter?: CuMeter;
@@ -140,6 +146,38 @@ class NonceCoordinator {
   }
 }
 
+class RedisNonceCoordinator {
+  private redis: any;
+  private provider: JsonRpcProvider;
+  private address: string;
+  private readonly cuMeter?: CuMeter;
+
+  constructor(redis: any, provider: JsonRpcProvider, address: string, cuMeter?: CuMeter) {
+    this.provider = provider;
+    this.address = address;
+    this.cuMeter = cuMeter;
+  }
+
+  async acquire(): Promise<number> {
+    const key = `nonce:${this.address}`;
+    // ensure key exists with on-chain pending nonce if absent
+    const cur = await this.redis.get(key);
+    if (cur === null) {
+      const onchain = await this.provider.getTransactionCount(this.address, "pending");
+      this.cuMeter?.recordMethod("eth_getTransactionCount");
+      // set initial value if not exists
+      await this.redis.set(key, String(onchain), "NX");
+    }
+    const v = await this.redis.incr(key);
+    // redis.incr returns next value; allocated nonce is v-1
+    return v - 1;
+  }
+
+  setProvider(provider: JsonRpcProvider) {
+    this.provider = provider;
+  }
+}
+
 export class ExecutorClient {
   private static readonly FEE_CACHE_TTL_MS = 5_000;
   private static readonly GAS_ESTIMATE_TTL_MS = 30_000;
@@ -150,7 +188,7 @@ export class ExecutorClient {
   private readonly relayProvider?: JsonRpcProvider;
   private readonly signerWallet?: Wallet;
   private address?: string;
-  private nonceCoordinator?: NonceCoordinator;
+  private nonceCoordinator?: INonceCoordinator;
   private readonly submissionMode: "public_only" | "relay_preferred" | "relay_only";
   private readonly allowPublicMempool: boolean;
   private readonly contractAddress?: string;
@@ -329,19 +367,15 @@ export class ExecutorClient {
     if (config.REMOTE_SIGNER_URL) {
       try {
         this.remoteSigner = new RemoteSigner(config.REMOTE_SIGNER_URL);
-        // asynchronously resolve remote signer address and initialize nonce coordinator
-        if (this.provider || this.relayProvider) {
-          const probe = this.provider ?? this.relayProvider!;
-          void this.remoteSigner
-            .getAddress()
-            .then((addr) => {
-              this.address = addr.toLowerCase();
-              this.nonceCoordinator = new NonceCoordinator(probe, this.address!, this.cuMeter);
-            })
-            .catch((err) => {
-              this.log.error({ error: err }, "failed to initialize remote signer address");
-            });
-        }
+        // asynchronously resolve remote signer address; nonce coordinator will be initialized later
+        void this.remoteSigner
+          .getAddress()
+          .then((addr) => {
+            this.address = addr.toLowerCase();
+          })
+          .catch((err) => {
+            this.log.error({ error: err }, "failed to initialize remote signer address");
+          });
       } catch (error) {
         this.log.error({ error }, "failed to initialize remote signer");
       }
@@ -351,9 +385,33 @@ export class ExecutorClient {
       this.relayProvider = new JsonRpcProvider(config.PRIVATE_RELAY_RPC_URL);
     }
 
+    let redisClient: any | undefined;
+    if (config.REDIS_URL) {
+      try {
+        const RedisCtor: any = Redis;
+        redisClient = new RedisCtor(config.REDIS_URL);
+      } catch (err) {
+        this.log.error({ error: err }, "failed to initialize Redis client for nonce coordination");
+      }
+    }
+
     if (this.signerWallet && (this.provider || this.relayProvider)) {
       const probe = this.provider ?? this.relayProvider!;
-      this.nonceCoordinator = new NonceCoordinator(probe, this.signerWallet.address, this.cuMeter);
+      if (redisClient) {
+        this.nonceCoordinator = new RedisNonceCoordinator(redisClient, probe, this.signerWallet.address, this.cuMeter);
+      } else {
+        this.nonceCoordinator = new NonceCoordinator(probe, this.signerWallet.address, this.cuMeter);
+      }
+    }
+
+    // If remote signer resolved its address earlier, initialize nonce coordinator now if not set
+    if (!this.nonceCoordinator && this.address && (this.provider || this.relayProvider)) {
+      const probe = this.provider ?? this.relayProvider!;
+      if (redisClient) {
+        this.nonceCoordinator = new RedisNonceCoordinator(redisClient, probe, this.address, this.cuMeter);
+      } else {
+        this.nonceCoordinator = new NonceCoordinator(probe, this.address!, this.cuMeter);
+      }
     }
 
     if (this.provider) {
