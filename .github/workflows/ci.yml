@@ -84,38 +84,19 @@ jobs:
           cd rust-core
           cargo build --release --locked
 
-      - name: Create rust Dockerfile
-        run: |
-          cat > rust-core/Dockerfile.ci <<'EOF'
-          FROM debian:bookworm-slim
-          COPY rust-core/target/release/rust-core /usr/local/bin/rust-core
-          RUN chmod +x /usr/local/bin/rust-core
-          ENTRYPOINT ["/usr/local/bin/rust-core"]
-          EOF
-
       - name: Build and push rust-core image
         uses: docker/build-push-action@v4
         with:
-          context: .
-          file: rust-core/Dockerfile.ci
+          context: ./rust-core
+          file: rust-core/Dockerfile
           push: true
           tags: ${{ env.IMAGE_RUST }}
-
-      - name: Create control-plane Dockerfile
-        run: |
-          cat > control-plane/Dockerfile.ci <<'EOF'
-          FROM node:18-alpine
-          WORKDIR /app
-          COPY control-plane/package.json control-plane/package-lock.json ./
-          COPY control-plane/dist ./dist
-          CMD ["node", "dist/index.js"]
-          EOF
 
       - name: Build and push control-plane image
         uses: docker/build-push-action@v4
         with:
-          context: .
-          file: control-plane/Dockerfile.ci
+          context: ./
+          file: control-plane/Dockerfile
           push: true
           tags: ${{ env.IMAGE_CONTROL_PLANE }}
 
