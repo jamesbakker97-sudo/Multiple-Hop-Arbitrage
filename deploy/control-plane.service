@@ -1,0 +1,17 @@
+[Unit]
+Description=Control Plane (Multiple-Hop-Arbitrage)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=notify
+WorkingDirectory=/path/to/Multiple-Hop-Arbitrage
+ExecStart=/usr/local/bin/docker-compose -f /path/to/Multiple-Hop-Arbitrage/control-plane/docker-compose.prod.yml up
+ExecStop=/usr/local/bin/docker-compose -f /path/to/Multiple-Hop-Arbitrage/control-plane/docker-compose.prod.yml down
+Restart=always
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+
+# Replace /path/to/Multiple-Hop-Arbitrage with the full repository path on the host.

@@ -1,0 +1,23 @@
+version: '3.8'
+services:
+  control-plane:
+    image: control-plane:prod
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    env_file:
+      - ../.env
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - ${EXECUTOR_PRIVATE_KEY_PATH}:/run/secrets/executor.key:ro
+      - ./logs:/app/logs
+    environment:
+      - EXECUTOR_PRIVATE_KEY_PATH=/run/secrets/executor.key
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
